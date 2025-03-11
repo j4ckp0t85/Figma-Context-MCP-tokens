@@ -1,0 +1,349 @@
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { z } from "zod";
+import { FigmaService } from "./services/figma";
+import express, { Request, Response } from "express";
+import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
+import { IncomingMessage, ServerResponse } from "http";
+import { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
+import { SimplifiedDesign } from "./services/simplify-node-response";
+import { generateDesignTokens, TokenGenerationOptions } from "./utils/design-tokens";
+
+export const Logger = {
+  log: (...args: any[]) => {},
+  error: (...args: any[]) => {},
+};
+
+export class FigmaMcpServer {
+  private readonly server: McpServer;
+  private readonly figmaService: FigmaService;
+  private sseTransport: SSEServerTransport | null = null;
+
+  constructor(figmaApiKey: string) {
+    this.figmaService = new FigmaService(figmaApiKey);
+    this.server = new McpServer(
+      {
+        name: "Figma MCP Server",
+        version: "0.1.7",
+      },
+      {
+        capabilities: {
+          logging: {},
+          tools: {},
+        },
+      },
+    );
+
+    this.registerTools();
+  }
+
+  private registerTools(): void {
+    // Tool to get file information
+    this.server.tool(
+      "get_figma_data",
+      "When the nodeId cannot be obtained, obtain the layout information about the entire Figma file",
+      {
+        fileKey: z
+          .string()
+          .describe(
+            "The key of the Figma file to fetch, often found in a provided URL like figma.com/(file|design)/<fileKey>/...",
+          ),
+        nodeId: z
+          .string()
+          .optional()
+          .describe(
+            "Optional node ID to get specific information about a node - from figma.com/design/<fileKey>/<viewId>?node-id=<nodeId>",
+          ),
+        depth: z
+          .number()
+          .int()
+          .min(1)
+          .max(10)
+          .default(3)
+          .describe("How many levels deep to traverse the node tree. Default: 3"),
+        extractCssProperties: z
+          .boolean()
+          .default(true)
+          .describe(
+            "Whether to extract detailed CSS properties for each node. Default: true"
+          ),
+      },
+      async (params, extra) => {
+        const { fileKey, nodeId, depth, extractCssProperties } = params;
+
+        Logger.log("Fetching file:", fileKey, nodeId ? `nodeId: ${nodeId}` : "");
+
+        try {
+          let data: SimplifiedDesign;
+          if (nodeId) {
+            data = await this.figmaService.getNode(fileKey, nodeId, depth);
+          } else {
+            data = await this.figmaService.getFile(fileKey, depth);
+          }
+
+          // Se l'utente non desidera le proprietà CSS dettagliate, le rimuoviamo dalla risposta
+          if (!extractCssProperties) {
+            // Funzione ricorsiva per rimuovere le proprietà CSS dai nodi
+            const removeCssProperties = (node: any) => {
+              if (node.css) {
+                delete node.css;
+              }
+              if (node.children && Array.isArray(node.children)) {
+                node.children.forEach(removeCssProperties);
+              }
+            };
+
+            // Rimuovi le proprietà CSS da tutti i nodi
+            data.nodes.forEach(removeCssProperties);
+          }
+
+          // Creiamo una risposta JSON con i dati
+          const responseJson = JSON.stringify({
+            success: true,
+            data
+          });
+
+          return {
+            content: [{ type: "text", text: responseJson }]
+          };
+        } catch (error) {
+          Logger.error("Error fetching Figma data:", error);
+          
+          const errorJson = JSON.stringify({
+            success: false,
+            error: `Failed to fetch Figma data: ${
+              error instanceof Error ? error.message : String(error)
+            }`
+          });
+          
+          return {
+            content: [{ type: "text", text: errorJson }],
+            isError: true
+          };
+        }
+      },
+    );
+
+    // Tool per generare token di design
+    this.server.tool(
+      "generate_design_tokens",
+      "Genera token di design da un file Figma e li esporta in un formato specifico",
+      {
+        fileKey: z
+          .string()
+          .describe(
+            "The key of the Figma file to fetch, often found in a provided URL like figma.com/(file|design)/<fileKey>/...",
+          ),
+        nodeId: z
+          .string()
+          .optional()
+          .describe(
+            "Optional node ID to get specific information about a node - from figma.com/design/<fileKey>/<viewId>?node-id=<nodeId>",
+          ),
+        depth: z
+          .number()
+          .int()
+          .min(1)
+          .max(10)
+          .default(3)
+          .describe("How many levels deep to traverse the node tree. Default: 3"),
+        format: z
+          .enum(["css", "scss", "json", "ts"])
+          .default("css")
+          .describe("Il formato di output per i token di design"),
+        outputPath: z
+          .string()
+          .optional()
+          .describe("Il percorso del file in cui salvare i token di design"),
+        prefix: z
+          .string()
+          .optional()
+          .default("")
+          .describe("Prefisso opzionale per i nomi delle variabili (es. 'my-app-')"),
+      },
+      async (params, extra) => {
+        const { fileKey, nodeId, depth, format, outputPath, prefix } = params;
+
+        Logger.log("Fetching design tokens from Figma:", fileKey, nodeId ? `nodeId: ${nodeId}` : "");
+
+        try {
+          // Ottieni i dati del design
+          let designData: SimplifiedDesign;
+          if (nodeId) {
+            designData = await this.figmaService.getNode(fileKey, nodeId, depth);
+          } else {
+            designData = await this.figmaService.getFile(fileKey, depth);
+          }
+
+          // Genera i token di design
+          const options: TokenGenerationOptions = {
+            format: format as any,
+            outputPath,
+            prefix,
+          };
+
+          const tokens = generateDesignTokens(designData, options);
+
+          // Restituisci un messaggio di successo
+          const responseJson = JSON.stringify({
+            success: true,
+            message: `Design tokens generati con successo${outputPath ? ` e salvati in ${outputPath}` : ''}`,
+            tokensCount: {
+              colors: Object.keys(tokens.colors).length,
+              typography: Object.keys(tokens.typography).length,
+              spacing: Object.keys(tokens.spacing).length,
+              radii: Object.keys(tokens.radii).length,
+              shadows: Object.keys(tokens.shadows).length,
+              opacity: Object.keys(tokens.opacity).length,
+              gradients: Object.keys(tokens.gradients).length,
+              total: Object.values(tokens).reduce((acc, group) => acc + Object.keys(group).length, 0),
+            },
+          });
+
+          return {
+            content: [{ type: "text", text: responseJson }]
+          };
+        } catch (error) {
+          Logger.error("Error generating design tokens:", error);
+          
+          const errorJson = JSON.stringify({
+            success: false,
+            error: `Failed to generate design tokens: ${
+              error instanceof Error ? error.message : String(error)
+            }`
+          });
+          
+          return {
+            content: [{ type: "text", text: errorJson }],
+            isError: true
+          };
+        }
+      },
+    );
+
+    // TODO: Clean up all image download related code, particularly getImages in Figma service
+    // Tool to download images
+    this.server.tool(
+      "download_figma_images",
+      "Download SVG and PNG images used in a Figma file based on the IDs of image or icon nodes",
+      {
+        fileKey: z.string().describe("The key of the Figma file containing the node"),
+        nodes: z
+          .object({
+            nodeId: z
+              .string()
+              .describe("The ID of the Figma image node to fetch, formatted as 1234:5678"),
+            imageRef: z
+              .string()
+              .optional()
+              .describe(
+                "If a node has an imageRef fill, you must include this variable. Leave blank when downloading Vector SVG images.",
+              ),
+            fileName: z.string().describe("The local name for saving the fetched file"),
+          })
+          .array()
+          .describe("The nodes to fetch as images"),
+        localPath: z
+          .string()
+          .describe(
+            "The absolute path to the directory where images are stored in the project. Automatically creates directories if needed.",
+          ),
+      },
+      async ({ fileKey, nodes, localPath }) => {
+        try {
+          const imageFills = nodes.filter(({ imageRef }) => !!imageRef) as {
+            nodeId: string;
+            imageRef: string;
+            fileName: string;
+          }[];
+          const fillDownloads = this.figmaService.getImageFills(fileKey, imageFills, localPath);
+          const renderRequests = nodes
+            .filter(({ imageRef }) => !imageRef)
+            .map(({ nodeId, fileName }) => ({
+              nodeId,
+              fileName,
+              fileType: fileName.endsWith(".svg") ? ("svg" as const) : ("png" as const),
+            }));
+
+          const renderDownloads = this.figmaService.getImages(fileKey, renderRequests, localPath);
+
+          const downloads = await Promise.all([fillDownloads, renderDownloads]).then(([f, r]) => [
+            ...f,
+            ...r,
+          ]);
+
+          // If any download fails, return false
+          const saveSuccess = !downloads.find((success) => !success);
+          return {
+            content: [
+              {
+                type: "text",
+                text: saveSuccess
+                  ? `Success, ${downloads.length} images downloaded: ${downloads.join(", ")}`
+                  : "Failed",
+              },
+            ],
+          };
+        } catch (error) {
+          Logger.error(`Error downloading images from file ${fileKey}:`, error);
+          return {
+            content: [{ type: "text", text: `Error downloading images: ${error}` }],
+          };
+        }
+      },
+    );
+  }
+
+  async connect(transport: Transport): Promise<void> {
+    // Logger.log("Connecting to transport...");
+    await this.server.connect(transport);
+
+    Logger.log = (...args: any[]) => {
+      this.server.server.sendLoggingMessage({
+        level: "info",
+        data: args,
+      });
+    };
+    Logger.error = (...args: any[]) => {
+      this.server.server.sendLoggingMessage({
+        level: "error",
+        data: args,
+      });
+    };
+
+    Logger.log("Server connected and ready to process requests");
+  }
+
+  async startHttpServer(port: number): Promise<void> {
+    const app = express();
+
+    app.get("/sse", async (req: Request, res: Response) => {
+      console.log("New SSE connection established");
+      this.sseTransport = new SSEServerTransport(
+        "/messages",
+        res as unknown as ServerResponse<IncomingMessage>,
+      );
+      await this.server.connect(this.sseTransport);
+    });
+
+    app.post("/messages", async (req: Request, res: Response) => {
+      if (!this.sseTransport) {
+        // @ts-expect-error Not sure why Express types aren't working
+        res.sendStatus(400);
+        return;
+      }
+      await this.sseTransport.handlePostMessage(
+        req as unknown as IncomingMessage,
+        res as unknown as ServerResponse<IncomingMessage>,
+      );
+    });
+
+    Logger.log = console.log;
+    Logger.error = console.error;
+
+    app.listen(port, () => {
+      Logger.log(`HTTP server listening on port ${port}`);
+      Logger.log(`SSE endpoint available at http://localhost:${port}/sse`);
+      Logger.log(`Message endpoint available at http://localhost:${port}/messages`);
+    });
+  }
+}
